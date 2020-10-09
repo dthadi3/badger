@@ -24,10 +24,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/dgraph-io/badger/v2/fb"
 	"github.com/dgraph-io/badger/v2/pb"
 	"github.com/dgraph-io/badger/v2/y"
+	"github.com/dgraph-io/ristretto/z"
 	humanize "github.com/dustin/go-humanize"
 	"github.com/golang/protobuf/proto"
+	fbs "github.com/google/flatbuffers/go"
+	"github.com/pkg/errors"
 )
 
 const batchSize = 16 << 20 // 16 MB
@@ -69,23 +73,25 @@ type Stream struct {
 	// function by default.
 	//
 	// Note: Calls to KeyToList are concurrent.
-	KeyToList func(key []byte, itr *Iterator) (*pb.KVList, error)
+	KeyToList func(key []byte, itr *Iterator) ([]byte, error)
 
 	// This is the method where Stream sends the final output. All calls to Send are done by a
 	// single goroutine, i.e. logic within Send method can expect single threaded execution.
-	Send func(*pb.KVList) error
+	Send func([]byte) error
 
 	readTs       uint64
 	db           *DB
 	rangeCh      chan keyRange
-	kvChan       chan *pb.KVList
+	kvChan       chan *z.Buffer
 	nextStreamId uint32
 }
 
 // ToList is a default implementation of KeyToList. It picks up all valid versions of the key,
 // skipping over deleted or expired keys.
-func (st *Stream) ToList(key []byte, itr *Iterator) (*pb.KVList, error) {
-	list := &pb.KVList{}
+func (st *Stream) ToList(key []byte, itr *Iterator) ([]byte, error) {
+	var kvs []fbs.UOffsetT
+	builder := fbs.NewBuilder(128)
+
 	for ; itr.Valid(); itr.Next() {
 		item := itr.Item()
 		if item.IsDeletedOrExpired() {
@@ -96,18 +102,23 @@ func (st *Stream) ToList(key []byte, itr *Iterator) (*pb.KVList, error) {
 			break
 		}
 
-		valCopy, err := item.ValueCopy(nil)
-		if err != nil {
+		k := builder.CreateByteVector(item.Key())
+		var v fbs.UOffsetT
+		if err := item.Value(func(val []byte) error {
+			v = builder.CreateByteVector(val)
+			return nil
+		}); err != nil {
 			return nil, err
 		}
-		kv := &pb.KV{
-			Key:       item.KeyCopy(nil),
-			Value:     valCopy,
-			UserMeta:  []byte{item.UserMeta()},
-			Version:   item.Version(),
-			ExpiresAt: item.ExpiresAt(),
-		}
-		list.Kv = append(list.Kv, kv)
+
+		fb.KVStart(builder)
+		fb.KVAddKey(builder, k)
+		fb.KVAddValue(builder, v)
+		fb.KVAddUserMeta(builder, item.UserMeta())
+		fb.KVAddVersion(builder, item.Version())
+		fb.KVAddExpiresAt(builder, item.ExpiresAt())
+		kvs = append(kvs, fb.KVEnd(builder))
+
 		if st.db.opt.NumVersionsToKeep == 1 {
 			break
 		}
@@ -116,7 +127,17 @@ func (st *Stream) ToList(key []byte, itr *Iterator) (*pb.KVList, error) {
 			break
 		}
 	}
-	return list, nil
+	addListAndFinish(builder, kvs)
+	return builder.FinishedBytes(), nil
+}
+
+func addListAndFinish(builder *fbs.Builder, kvs []fbs.UOffsetT) {
+	fb.KVListStart(builder)
+	for i := len(kvs) - 1; i >= 0; i-- {
+		fb.KVListAddKvs(builder, kvs[i])
+	}
+	uo := fb.KVListEnd(builder)
+	builder.Finish(uo)
 }
 
 // keyRange is [start, end), including start, excluding end. Do ensure that the start,
@@ -174,7 +195,8 @@ func (st *Stream) produceKVs(ctx context.Context, threadId int) error {
 		// This unique stream id is used to identify all the keys from this iteration.
 		streamId := atomic.AddUint32(&st.nextStreamId, 1)
 
-		outList := new(pb.KVList)
+		bufSize := float64(batchSize) * 1.2
+		outList := z.NewBuffer(int(bufSize))
 
 		sendIt := func() error {
 			select {
@@ -182,7 +204,7 @@ func (st *Stream) produceKVs(ctx context.Context, threadId int) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			}
-			outList = new(pb.KVList)
+			outList = z.NewBuffer(int(bufSize))
 			size = 0
 			return nil
 		}
@@ -210,23 +232,27 @@ func (st *Stream) produceKVs(ctx context.Context, threadId int) error {
 			if err != nil {
 				return err
 			}
-			if list == nil || len(list.Kv) == 0 {
+			if len(list) == 0 {
 				continue
 			}
-			for _, kv := range list.Kv {
-				size += proto.Size(kv)
-				kv.StreamId = streamId
-				outList.Kv = append(outList.Kv, kv)
-
-				if size < batchSize {
-					continue
+			kvs := fb.GetRootAsKVList(list, 0)
+			var kv fb.KV
+			for i := 0; i < kvs.KvsLength(); i++ {
+				if !kvs.Kvs(&kv, i) {
+					return errors.Errorf("Unable to parse fb.KV at pos: %d", i)
 				}
-				if err := sendIt(); err != nil {
-					return err
-				}
+				kv.MutateStreamId(streamId)
+			}
+			dst := outList.SliceAllocate(len(list))
+			copy(dst, list)
+			if outList.Len() < batchSize {
+				continue
+			}
+			if err := sendIt(); err != nil {
+				return err
 			}
 		}
-		if len(outList.Kv) > 0 {
+		if !outList.IsEmpty() {
 			// TODO: Think of a way to indicate that a stream is over.
 			if err := sendIt(); err != nil {
 				return err
@@ -258,10 +284,13 @@ func (st *Stream) streamKVs(ctx context.Context) error {
 	defer t.Stop()
 	now := time.Now()
 
-	sendBatch := func(batch *pb.KVList) error {
-		sz := uint64(proto.Size(batch))
+	sendBatch := func(batch []byte) error {
+		sz := uint64(len(batch))
 		bytesSent += sz
-		count += len(batch.Kv)
+
+		kvs := fb.GetRootAsKVList(batch, 0)
+		count += kvs.KvsLength()
+
 		t := time.Now()
 		if err := st.Send(batch); err != nil {
 			return err

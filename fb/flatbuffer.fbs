@@ -24,12 +24,30 @@ table TableIndex {
   uncompressed_size:uint32;
   key_count:uint32;
 }
+root_type TableIndex;
 
 table BlockOffset {
   key:[ubyte];
   offset:uint;
   len:uint;
 }
-
-root_type TableIndex;
 root_type BlockOffset;
+
+table KV {
+  key        : [ubyte];
+  value      : [ubyte];
+  version    : uint64;
+  expires_at : uint64;
+  user_meta  : ubyte;
+  meta       : ubyte;
+
+  // Internal fields.
+  stream_id   : uint32;
+  stream_done : bool;
+}
+root_type KV;
+
+table KVList {
+  kvs: [KV];
+}
+root_type KVList;

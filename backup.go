@@ -23,9 +23,11 @@ import (
 	"encoding/binary"
 	"io"
 
+	"github.com/dgraph-io/badger/v2/fb"
 	"github.com/dgraph-io/badger/v2/pb"
 	"github.com/dgraph-io/badger/v2/y"
 	"github.com/golang/protobuf/proto"
+	fbs "github.com/google/flatbuffers/go"
 )
 
 // flushThreshold determines when a buffer will be flushed. When performing a
@@ -59,66 +61,80 @@ func (db *DB) Backup(w io.Writer, since uint64) (uint64, error) {
 //
 // This can be used to backup the data in a database at a given point in time.
 func (stream *Stream) Backup(w io.Writer, since uint64) (uint64, error) {
-	stream.KeyToList = func(key []byte, itr *Iterator) (*pb.KVList, error) {
-		list := &pb.KVList{}
-		for ; itr.Valid(); itr.Next() {
-			item := itr.Item()
-			if !bytes.Equal(item.Key(), key) {
-				return list, nil
-			}
-			if item.Version() < since {
-				// Ignore versions less than given timestamp, or skip older
-				// versions of the given key.
-				return list, nil
-			}
+	stream.KeyToList = func(key []byte, itr *Iterator) ([]byte, error) {
+		var kvs []fbs.UOffsetT
+		builder := fbs.NewBuilder(128)
+		ku := builder.CreateByteVector(key)
 
-			var valCopy []byte
-			if !item.IsDeletedOrExpired() {
-				// No need to copy value, if item is deleted or expired.
-				var err error
-				valCopy, err = item.ValueCopy(nil)
-				if err != nil {
-					stream.db.opt.Errorf("Key [%x, %d]. Error while fetching value [%v]\n",
-						item.Key(), item.Version(), err)
-					return nil, err
+		process := func() error {
+			for ; itr.Valid(); itr.Next() {
+				item := itr.Item()
+				if !bytes.Equal(item.Key(), key) {
+					return nil
+				}
+				if item.Version() < since {
+					// Ignore versions less than given timestamp, or skip older
+					// versions of the given key.
+					return nil
+				}
+
+				var vu fbs.UOffsetT
+				if !item.IsDeletedOrExpired() {
+					// No need to copy value, if item is deleted or expired.
+					if err := item.Value(func(val []byte) error {
+						vu = builder.CreateByteVector(val)
+						return nil
+					}); err != nil {
+						stream.db.opt.Errorf("Key [%x, %d]. Error while fetching value [%v]\n",
+							item.Key(), item.Version(), err)
+						return err
+					}
+				}
+
+				// clear txn bits
+				meta := item.meta &^ (bitTxn | bitFinTxn)
+
+				fb.KVStart(builder)
+				fb.KVAddKey(builder, ku)
+				fb.KVAddValue(builder, vu)
+				fb.KVAddMeta(builder, meta)
+				fb.KVAddUserMeta(builder, item.UserMeta())
+				fb.KVAddVersion(builder, item.Version())
+				fb.KVAddExpiresAt(builder, item.ExpiresAt())
+				kvs = append(kvs, fb.KVEnd(builder))
+
+				switch {
+				case item.DiscardEarlierVersions():
+					// If we need to discard earlier versions of this item, add a delete
+					// marker just below the current version.
+					fb.KVStart(builder)
+					fb.KVAddKey(builder, ku)
+					fb.KVAddVersion(builder, item.Version()-1)
+					fb.KVAddMeta(builder, bitDelete)
+					kvs = append(kvs, fb.KVEnd(builder))
+					return nil
+
+				case item.IsDeletedOrExpired():
+					return nil
 				}
 			}
-
-			// clear txn bits
-			meta := item.meta &^ (bitTxn | bitFinTxn)
-			kv := &pb.KV{
-				Key:       item.KeyCopy(nil),
-				Value:     valCopy,
-				UserMeta:  []byte{item.UserMeta()},
-				Version:   item.Version(),
-				ExpiresAt: item.ExpiresAt(),
-				Meta:      []byte{meta},
-			}
-			list.Kv = append(list.Kv, kv)
-
-			switch {
-			case item.DiscardEarlierVersions():
-				// If we need to discard earlier versions of this item, add a delete
-				// marker just below the current version.
-				list.Kv = append(list.Kv, &pb.KV{
-					Key:     item.KeyCopy(nil),
-					Version: item.Version() - 1,
-					Meta:    []byte{bitDelete},
-				})
-				return list, nil
-
-			case item.IsDeletedOrExpired():
-				return list, nil
-			}
+			return nil
 		}
-		return list, nil
+		process()
+		addListAndFinish(builder, kvs)
+		return builder.FinishedBytes(), nil
 	}
 
 	var maxVersion uint64
-	stream.Send = func(list *pb.KVList) error {
-		for _, kv := range list.Kv {
-			if maxVersion < kv.Version {
-				maxVersion = kv.Version
+	stream.Send = func(list []byte) error {
+		kvs := fb.GetRootAsKVList(list, 0)
+		for i := 0; i < kvs.KvsLength(); i++ {
+			var kv fb.KV
+			if ok := kvs.Kvs(&kv, i); !ok {
+				continue
+			}
+			if maxVersion < kv.Version() {
+				maxVersion = kv.Version()
 			}
 		}
 		return writeTo(list, w)
@@ -130,15 +146,11 @@ func (stream *Stream) Backup(w io.Writer, since uint64) (uint64, error) {
 	return maxVersion, nil
 }
 
-func writeTo(list *pb.KVList, w io.Writer) error {
-	if err := binary.Write(w, binary.LittleEndian, uint64(proto.Size(list))); err != nil {
+func writeTo(out []byte, w io.Writer) error {
+	if err := binary.Write(w, binary.LittleEndian, len(out)); err != nil {
 		return err
 	}
-	buf, err := proto.Marshal(list)
-	if err != nil {
-		return err
-	}
-	_, err = w.Write(buf)
+	_, err := w.Write(out)
 	return err
 }
 

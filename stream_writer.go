@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/dgraph-io/badger/v2/fb"
 	"github.com/dgraph-io/badger/v2/pb"
 	"github.com/dgraph-io/badger/v2/table"
 	"github.com/dgraph-io/badger/v2/y"
@@ -79,7 +80,8 @@ func (sw *StreamWriter) Prepare() error {
 // Write writes KVList to DB. Each KV within the list contains the stream id which StreamWriter
 // would use to demux the writes. Write is thread safe and can be called concurrently by multiple
 // goroutines.
-func (sw *StreamWriter) Write(kvs *pb.KVList) error {
+func (sw *StreamWriter) Write(data []byte) error {
+	kvs := fb.GetRootAsKVList(data, 0)
 	if len(kvs.GetKv()) == 0 {
 		return nil
 	}
