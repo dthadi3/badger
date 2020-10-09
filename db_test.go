@@ -33,11 +33,14 @@ import (
 	"testing"
 	"time"
 
+	fbs "github.com/google/flatbuffers/go"
 	"github.com/stretchr/testify/require"
 
+	"github.com/dgraph-io/badger/v2/fb"
 	"github.com/dgraph-io/badger/v2/options"
 	"github.com/dgraph-io/badger/v2/pb"
 	"github.com/dgraph-io/badger/v2/y"
+	"github.com/dgraph-io/ristretto/z"
 )
 
 // summary is produced when DB is closed. Currently it is used only for testing.
@@ -2057,6 +2060,58 @@ func TestForceFlushMemtable(t *testing.T) {
 		fmt.Sprintf("expected fid: %d, actual fid: %d", 2, db.nextMemFid))
 }
 
+func KVListProtoToFB(l *pb.KVList) []byte {
+	var kvs []fbs.UOffsetT
+	builder := fbs.NewBuilder(1024)
+	for _, kv := range l.Kv {
+		ko := builder.CreateByteVector(kv.Key)
+		vo := builder.CreateByteVector(kv.Value)
+		fb.KVStart(builder)
+		fb.KVAddKey(builder, ko)
+		fb.KVAddValue(builder, vo)
+		if len(kv.UserMeta) > 0 {
+			fb.KVAddUserMeta(builder, kv.UserMeta[0])
+		}
+		if len(kv.Meta) > 0 {
+			fb.KVAddMeta(builder, kv.Meta[0])
+		}
+		fb.KVAddVersion(builder, kv.Version)
+		fb.KVAddExpiresAt(builder, kv.ExpiresAt)
+		fb.KVAddStreamId(builder, kv.StreamId)
+		kvs = append(kvs, fb.KVEnd(builder))
+	}
+	y.AddListAndFinish(builder, kvs)
+	return builder.FinishedBytes()
+}
+
+func KVListToBuffer(l *pb.KVList) *z.Buffer {
+	data := KVListProtoToFB(l)
+	buf := z.NewBuffer(len(data) + 16)
+	buf.WriteSlice(data)
+	return buf
+}
+
+func KVListFBToProto(data []byte) *pb.KVList {
+	kvl := fb.GetRootAsKVList(data, 0)
+	var kv fb.KV
+
+	list := &pb.KVList{}
+	for i := 0; i < kvl.KvsLength(); i++ {
+		y.AssertTrue(kvl.Kvs(&kv, i))
+		pkv := &pb.KV{
+			Key:       y.Copy(kv.KeyBytes()),
+			Value:     y.Copy(kv.ValueBytes()),
+			Meta:      []byte{kv.Meta()},
+			UserMeta:  []byte{kv.UserMeta()},
+			Version:   kv.Version(),
+			StreamId:  kv.StreamId(),
+			ExpiresAt: kv.ExpiresAt(),
+		}
+		list.Kv = append(list.Kv, pkv)
+	}
+	return list
+}
+
 func TestVerifyChecksum(t *testing.T) {
 	testVerfiyCheckSum := func(t *testing.T, opt Options) {
 		path, err := ioutil.TempDir("", "badger-test")
@@ -2084,9 +2139,12 @@ func TestVerifyChecksum(t *testing.T) {
 				}
 			}
 
+			buf := KVListToBuffer(l)
+			defer buf.Release()
+
 			sw := db.NewStreamWriter()
 			require.NoError(t, sw.Prepare(), "sw.Prepare() failed")
-			require.NoError(t, sw.Write(l), "sw.Write() failed")
+			require.NoError(t, sw.Write(buf), "sw.Write() failed")
 			require.NoError(t, sw.Flush(), "sw.Flush() failed")
 
 			require.NoError(t, db.VerifyChecksum(), "checksum verification failed for DB")

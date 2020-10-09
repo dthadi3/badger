@@ -57,9 +57,12 @@ func TestStreamWriter1(t *testing.T) {
 			noOfKeys := 1000
 			valueSize := 128
 			list := getSortedKVList(valueSize, noOfKeys)
+			buf := KVListToBuffer(list)
+			defer buf.Release()
+
 			sw := db.NewStreamWriter()
 			require.NoError(t, sw.Prepare(), "sw.Prepare() failed")
-			require.NoError(t, sw.Write(list), "sw.Write() failed")
+			require.NoError(t, sw.Write(buf), "sw.Write() failed")
 			require.NoError(t, sw.Flush(), "sw.Flush() failed")
 
 			err := db.View(func(txn *Txn) error {

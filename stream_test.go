@@ -27,6 +27,7 @@ import (
 
 	bpb "github.com/dgraph-io/badger/v2/pb"
 	"github.com/dgraph-io/badger/v2/y"
+	"github.com/dgraph-io/ristretto/z"
 	"github.com/stretchr/testify/require"
 )
 
@@ -46,12 +47,16 @@ func value(k int) []byte {
 }
 
 type collector struct {
-	kv []*bpb.KV
+	kv    []*bpb.KV
+	count int
 }
 
-func (c *collector) Send(list *bpb.KVList) error {
-	c.kv = append(c.kv, list.Kv...)
-	return nil
+func (c *collector) Send(buf *z.Buffer) error {
+	return buf.SliceIterate(func(slice []byte) error {
+		list := KVListFBToProto(slice)
+		c.kv = append(c.kv, list.Kv...)
+		return nil
+	})
 }
 
 var ctxb = context.Background()
@@ -82,7 +87,7 @@ func TestStream(t *testing.T) {
 	// Test case 1. Retrieve everything.
 	err = stream.Orchestrate(ctxb)
 	require.NoError(t, err)
-	require.Equal(t, 300, len(c.kv), "Expected 300. Got: %d", len(c.kv))
+	require.Equal(t, 300, c.count, "Expected 300. Got: %d", c.count)
 
 	m := make(map[string]int)
 	for _, kv := range c.kv {
@@ -178,8 +183,7 @@ func TestStreamWithThreadId(t *testing.T) {
 
 	stream := db.NewStreamAt(math.MaxUint64)
 	stream.LogPrefix = "Testing"
-	stream.KeyToList = func(key []byte, itr *Iterator) (
-		*bpb.KVList, error) {
+	stream.KeyToList = func(key []byte, itr *Iterator) ([]byte, error) {
 		require.Less(t, itr.ThreadId, stream.NumGo)
 		return stream.ToList(key, itr)
 	}
