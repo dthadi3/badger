@@ -30,11 +30,12 @@ import (
 	"time"
 
 	humanize "github.com/dustin/go-humanize"
+	fbs "github.com/google/flatbuffers/go"
 	"github.com/spf13/cobra"
 
 	"github.com/dgraph-io/badger/v2"
+	"github.com/dgraph-io/badger/v2/fb"
 	"github.com/dgraph-io/badger/v2/options"
-	"github.com/dgraph-io/badger/v2/pb"
 	"github.com/dgraph-io/badger/v2/y"
 	"github.com/dgraph-io/ristretto/z"
 )
@@ -204,33 +205,59 @@ func writeSorted(db *badger.DB, num uint64) error {
 	}
 
 	wg := &sync.WaitGroup{}
-	writeCh := make(chan *pb.KVList, 3)
+	writeCh := make(chan []byte, 3)
 	writeRange := func(start, end uint64, streamId uint32) {
 		// end is not included.
 		defer wg.Done()
-		kvs := &pb.KVList{}
+
+		builder := fbs.NewBuilder(1024)
+
 		var sz int
+		var kvs []fbs.UOffsetT
+
 		for i := start; i < end; i++ {
 			key := make([]byte, 8)
 			binary.BigEndian.PutUint64(key, i)
-			kvs.Kv = append(kvs.Kv, &pb.KV{
-				Key:      key,
-				Value:    value,
-				Version:  1,
-				StreamId: streamId,
-			})
+			ko := builder.CreateByteVector(key)
+			vo := builder.CreateByteVector(value)
+
+			fb.KVStart(builder)
+			fb.KVAddKey(builder, ko)
+			fb.KVAddValue(builder, vo)
+			fb.KVAddStreamId(builder, streamId)
+			fb.KVAddVersion(builder, 1)
+			kvs = append(kvs, fb.KVEnd(builder))
 
 			sz += es
 			atomic.AddUint64(&entriesWritten, 1)
 			atomic.AddUint64(&sizeWritten, uint64(es))
 
 			if sz >= 4<<20 { // 4 MB
-				writeCh <- kvs
-				kvs = &pb.KVList{}
+				var last []byte
+				y.AddListAndFinish(builder, kvs)
+				data := builder.FinishedBytes()
+
+				kvl := fb.GetRootAsKVList(data, 0)
+				var kv fb.KV
+				for i := 0; i < kvl.KvsLength(); i++ {
+					y.AssertTrue(kvl.Kvs(&kv, i))
+					if bytes.Compare(kv.KeyBytes(), last) < 0 {
+						fmt.Printf("last: %x", last)
+						fmt.Printf("this: %x", kv.KeyBytes())
+						panic("not sorted")
+					}
+					last = y.SafeCopy(last, kv.KeyBytes())
+				}
+				writeCh <- data
 				sz = 0
+				kvs = kvs[:0]
+				builder = fbs.NewBuilder(1024)
 			}
 		}
-		writeCh <- kvs
+		if len(kvs) > 0 {
+			y.AddListAndFinish(builder, kvs)
+			writeCh <- builder.FinishedBytes()
+		}
 	}
 
 	// Let's create some streams.
@@ -250,10 +277,14 @@ func writeSorted(db *badger.DB, num uint64) error {
 		close(writeCh)
 	}()
 	log.Printf("Max StreamId used: %d. Width: %d\n", streamID, width)
+
 	for kvs := range writeCh {
-		if err := writer.Write(kvs); err != nil {
+		buf := z.NewBuffer(5 << 20)
+		buf.WriteSlice(kvs)
+		if err := writer.Write(buf); err != nil {
 			panic(err)
 		}
+		buf.Release()
 	}
 	log.Println("DONE streaming. Flushing...")
 	return writer.Flush()

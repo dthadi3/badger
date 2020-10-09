@@ -26,6 +26,7 @@ import (
 	"github.com/dgraph-io/badger/v2/fb"
 	"github.com/dgraph-io/badger/v2/pb"
 	"github.com/dgraph-io/badger/v2/y"
+	"github.com/dgraph-io/ristretto/z"
 	"github.com/golang/protobuf/proto"
 	fbs "github.com/google/flatbuffers/go"
 )
@@ -121,23 +122,27 @@ func (stream *Stream) Backup(w io.Writer, since uint64) (uint64, error) {
 			return nil
 		}
 		process()
-		addListAndFinish(builder, kvs)
+		y.AddListAndFinish(builder, kvs)
 		return builder.FinishedBytes(), nil
 	}
 
 	var maxVersion uint64
-	stream.Send = func(list []byte) error {
-		kvs := fb.GetRootAsKVList(list, 0)
-		for i := 0; i < kvs.KvsLength(); i++ {
-			var kv fb.KV
-			if ok := kvs.Kvs(&kv, i); !ok {
-				continue
+	stream.Send = func(buf *z.Buffer) error {
+		err := buf.SliceIterate(func(slice []byte) error {
+			kvs := fb.GetRootAsKVList(slice, 0)
+			for i := 0; i < kvs.KvsLength(); i++ {
+				var kv fb.KV
+				if ok := kvs.Kvs(&kv, i); !ok {
+					continue
+				}
+				if maxVersion < kv.Version() {
+					maxVersion = kv.Version()
+				}
 			}
-			if maxVersion < kv.Version() {
-				maxVersion = kv.Version()
-			}
-		}
-		return writeTo(list, w)
+			return nil
+		})
+		y.Check(err)
+		return writeTo(buf.Bytes(), w)
 	}
 
 	if err := stream.Orchestrate(context.Background()); err != nil {

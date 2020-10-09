@@ -25,10 +25,12 @@ import (
 	"time"
 
 	humanize "github.com/dustin/go-humanize"
+	fbs "github.com/google/flatbuffers/go"
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 
 	"github.com/dgraph-io/badger/v2"
-	"github.com/dgraph-io/badger/v2/pb"
+	"github.com/dgraph-io/badger/v2/fb"
 	"github.com/dgraph-io/badger/v2/y"
 	"github.com/dgraph-io/ristretto/z"
 )
@@ -197,28 +199,45 @@ func getSampleKeys(db *badger.DB) ([][]byte, error) {
 
 	// overide stream.KeyToList as we only want keys. Also
 	// we can take only first version for the key.
-	stream.KeyToList = func(key []byte, itr *badger.Iterator) (*pb.KVList, error) {
-		l := &pb.KVList{}
+	stream.KeyToList = func(key []byte, itr *badger.Iterator) ([]byte, error) {
 		// Since stream framework copies the item's key while calling
 		// KeyToList, we can directly append key to list.
-		l.Kv = append(l.Kv, &pb.KV{Key: key})
-		return l, nil
+		var kvs []fbs.UOffsetT
+		builder := fbs.NewBuilder(128)
+		ko := builder.CreateByteVector(key)
+		fb.KVStart(builder)
+		fb.KVAddKey(builder, ko)
+		kvs = append(kvs, fb.KVEnd(builder))
+		y.AddListAndFinish(builder, kvs)
+		builder.FinishedBytes()
+		return builder.FinishedBytes(), nil
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	stream.Send = func(l *pb.KVList) error {
+	stream.Send = func(buf *z.Buffer) error {
 		if count >= sampleSize {
 			return nil
 		}
-		for _, kv := range l.Kv {
-			keys = append(keys, kv.Key)
-			count++
+		return buf.SliceIterate(func(data []byte) error {
 			if count >= sampleSize {
 				cancel()
+				return ctx.Err()
+			}
+			kvs := fb.GetRootAsKVList(data, 0)
+			if kvs.KvsLength() == 0 {
 				return nil
 			}
-		}
+			var kv fb.KV
+			for i := 0; i < kvs.KvsLength(); i++ {
+				if !kvs.Kvs(&kv, i) {
+					return errors.Errorf("while parsing KV at offset: %d\n", i)
+				}
+				keys = append(keys, y.Copy(kv.KeyBytes()))
+				count++
+			}
+			return nil
+		})
 		return nil
 	}
 

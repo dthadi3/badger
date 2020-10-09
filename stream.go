@@ -25,11 +25,9 @@ import (
 	"time"
 
 	"github.com/dgraph-io/badger/v2/fb"
-	"github.com/dgraph-io/badger/v2/pb"
 	"github.com/dgraph-io/badger/v2/y"
 	"github.com/dgraph-io/ristretto/z"
 	humanize "github.com/dustin/go-humanize"
-	"github.com/golang/protobuf/proto"
 	fbs "github.com/google/flatbuffers/go"
 	"github.com/pkg/errors"
 )
@@ -40,7 +38,7 @@ const batchSize = 16 << 20 // 16 MB
 // as a single list that is still over the limit will have to be sent as is since it
 // cannot be split further. This limit prevents the framework from creating batches
 // so big that sending them causes issues (e.g running into the max size gRPC limit).
-var maxStreamSize = uint64(100 << 20) // 100MB
+var maxStreamSize = int(100 << 20) // 100MB
 
 // Stream provides a framework to concurrently iterate over a snapshot of Badger, pick up
 // key-values, batch them up and call Send. Stream does concurrent iteration over many smaller key
@@ -77,7 +75,7 @@ type Stream struct {
 
 	// This is the method where Stream sends the final output. All calls to Send are done by a
 	// single goroutine, i.e. logic within Send method can expect single threaded execution.
-	Send func([]byte) error
+	Send func(buf *z.Buffer) error
 
 	readTs       uint64
 	db           *DB
@@ -90,7 +88,8 @@ type Stream struct {
 // skipping over deleted or expired keys.
 func (st *Stream) ToList(key []byte, itr *Iterator) ([]byte, error) {
 	var kvs []fbs.UOffsetT
-	builder := fbs.NewBuilder(128)
+	builder := fbs.NewBuilder(1024)
+	k := builder.CreateByteVector(key)
 
 	for ; itr.Valid(); itr.Next() {
 		item := itr.Item()
@@ -102,7 +101,6 @@ func (st *Stream) ToList(key []byte, itr *Iterator) ([]byte, error) {
 			break
 		}
 
-		k := builder.CreateByteVector(item.Key())
 		var v fbs.UOffsetT
 		if err := item.Value(func(val []byte) error {
 			v = builder.CreateByteVector(val)
@@ -127,17 +125,8 @@ func (st *Stream) ToList(key []byte, itr *Iterator) ([]byte, error) {
 			break
 		}
 	}
-	addListAndFinish(builder, kvs)
+	y.AddListAndFinish(builder, kvs)
 	return builder.FinishedBytes(), nil
-}
-
-func addListAndFinish(builder *fbs.Builder, kvs []fbs.UOffsetT) {
-	fb.KVListStart(builder)
-	for i := len(kvs) - 1; i >= 0; i-- {
-		fb.KVListAddKvs(builder, kvs[i])
-	}
-	uo := fb.KVListEnd(builder)
-	builder.Finish(uo)
 }
 
 // keyRange is [start, end), including start, excluding end. Do ensure that the start,
@@ -284,12 +273,15 @@ func (st *Stream) streamKVs(ctx context.Context) error {
 	defer t.Stop()
 	now := time.Now()
 
-	sendBatch := func(batch []byte) error {
-		sz := uint64(len(batch))
+	sendBatch := func(batch *z.Buffer) error {
+		sz := uint64(batch.Len())
 		bytesSent += sz
 
-		kvs := fb.GetRootAsKVList(batch, 0)
-		count += kvs.KvsLength()
+		batch.SliceIterate(func(slice []byte) error {
+			kvs := fb.GetRootAsKVList(slice, 0)
+			count += kvs.KvsLength()
+			return nil
+		})
 
 		t := time.Now()
 		if err := st.Send(batch); err != nil {
@@ -300,23 +292,23 @@ func (st *Stream) streamKVs(ctx context.Context) error {
 		return nil
 	}
 
-	slurp := func(batch *pb.KVList) error {
+	slurp := func(batch *z.Buffer) error {
+		defer batch.Release()
 	loop:
 		for {
 			// Send the batch immediately if it already exceeds the maximum allowed size.
 			// If the size of the batch exceeds maxStreamSize, break from the loop to
 			// avoid creating a batch that is so big that certain limits are reached.
-			sz := uint64(proto.Size(batch))
-			if sz > maxStreamSize {
+			if batch.Len() > maxStreamSize {
 				break loop
 			}
 			select {
-			case kvs, ok := <-st.kvChan:
+			case buf, ok := <-st.kvChan:
 				if !ok {
 					break loop
 				}
-				y.AssertTrue(kvs != nil)
-				batch.Kv = append(batch.Kv, kvs.Kv...)
+				y.Check2(batch.Write(buf.Bytes()))
+				buf.Release()
 			default:
 				break loop
 			}
@@ -326,7 +318,7 @@ func (st *Stream) streamKVs(ctx context.Context) error {
 
 outer:
 	for {
-		var batch *pb.KVList
+		var batch *z.Buffer
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -341,12 +333,14 @@ outer:
 			st.db.opt.Infof("%s Time elapsed: %s, bytes sent: %s, speed: %s/sec\n", st.LogPrefix,
 				y.FixedDuration(dur), humanize.Bytes(bytesSent), humanize.Bytes(speed))
 
-		case kvs, ok := <-st.kvChan:
+		case buf, ok := <-st.kvChan:
 			if !ok {
 				break outer
 			}
-			y.AssertTrue(kvs != nil)
-			batch = kvs
+			if buf.IsEmpty() {
+				continue
+			}
+			batch = buf
 
 			// Otherwise, slurp more keys into this batch.
 			if err := slurp(batch); err != nil {
@@ -371,7 +365,7 @@ func (st *Stream) Orchestrate(ctx context.Context) error {
 	// kvChan should only have a small capacity to ensure that we don't buffer up too much data if
 	// sending is slow. Page size is set to 4MB, which is used to lazily cap the size of each
 	// KVList. To get 128MB buffer, we can set the channel size to 32.
-	st.kvChan = make(chan *pb.KVList, 32)
+	st.kvChan = make(chan *z.Buffer, 32)
 
 	if st.KeyToList == nil {
 		st.KeyToList = st.ToList

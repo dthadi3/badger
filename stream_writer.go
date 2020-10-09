@@ -80,54 +80,64 @@ func (sw *StreamWriter) Prepare() error {
 // Write writes KVList to DB. Each KV within the list contains the stream id which StreamWriter
 // would use to demux the writes. Write is thread safe and can be called concurrently by multiple
 // goroutines.
-func (sw *StreamWriter) Write(data []byte) error {
-	kvs := fb.GetRootAsKVList(data, 0)
-	if len(kvs.GetKv()) == 0 {
-		return nil
-	}
-
+func (sw *StreamWriter) Write(buf *z.Buffer) error {
 	// closedStreams keeps track of all streams which are going to be marked as done. We are
 	// keeping track of all streams so that we can close them at the end, after inserting all
 	// the valid kvs.
 	closedStreams := make(map[uint32]struct{})
 	streamReqs := make(map[uint32]*request)
-	for _, kv := range kvs.Kv {
-		if kv.StreamDone {
-			closedStreams[kv.StreamId] = struct{}{}
-			continue
+
+	parse := func(data []byte) error {
+		kvs := fb.GetRootAsKVList(data, 0)
+		if kvs.KvsLength() == 0 {
+			return nil
 		}
 
-		// Panic if some kv comes after stream has been marked as closed.
-		if _, ok := closedStreams[kv.StreamId]; ok {
-			panic(fmt.Sprintf("write performed on closed stream: %d", kv.StreamId))
-		}
+		var kv fb.KV
+		for i := 0; i < kvs.KvsLength(); i++ {
+			if !kvs.Kvs(&kv, i) {
+				return errors.Errorf("while parsing KV at offset: %d\n", i)
+			}
+			streamId := kv.StreamId()
+			if kv.StreamDone() {
+				closedStreams[streamId] = struct{}{}
+				continue
+			}
 
-		var meta, userMeta byte
-		if len(kv.Meta) > 0 {
-			meta = kv.Meta[0]
+			// Panic if some kv comes after stream has been marked as closed.
+			if _, ok := closedStreams[streamId]; ok {
+				panic(fmt.Sprintf("write performed on closed stream: %d", streamId))
+			}
+
+			if sw.maxVersion < kv.Version() {
+				sw.maxVersion = kv.Version()
+			}
+			e := &Entry{
+				Key:       y.KeyWithTs(kv.KeyBytes(), kv.Version()),
+				Value:     y.Copy(kv.ValueBytes()),
+				UserMeta:  kv.UserMeta(),
+				ExpiresAt: kv.ExpiresAt(),
+				meta:      kv.Meta(),
+			}
+			// If the value can be collocated with the key in LSM tree, we can skip
+			// writing the value to value log.
+			req := streamReqs[streamId]
+			if req == nil {
+				req = &request{}
+				streamReqs[streamId] = req
+			}
+			req.Entries = append(req.Entries, e)
 		}
-		if len(kv.UserMeta) > 0 {
-			userMeta = kv.UserMeta[0]
-		}
-		if sw.maxVersion < kv.Version {
-			sw.maxVersion = kv.Version
-		}
-		e := &Entry{
-			Key:       y.KeyWithTs(kv.Key, kv.Version),
-			Value:     kv.Value,
-			UserMeta:  userMeta,
-			ExpiresAt: kv.ExpiresAt,
-			meta:      meta,
-		}
-		// If the value can be collocated with the key in LSM tree, we can skip
-		// writing the value to value log.
-		req := streamReqs[kv.StreamId]
-		if req == nil {
-			req = &request{}
-			streamReqs[kv.StreamId] = req
-		}
-		req.Entries = append(req.Entries, e)
+		return nil
 	}
+
+	// Start parsing here.
+	if err := buf.SliceIterate(func(slice []byte) error {
+		return parse(slice)
+	}); err != nil {
+		return err
+	}
+
 	all := make([]*request, 0, len(streamReqs))
 	for _, req := range streamReqs {
 		all = append(all, req)

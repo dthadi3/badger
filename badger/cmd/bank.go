@@ -31,9 +31,11 @@ import (
 	"time"
 
 	"github.com/dgraph-io/badger/v2"
+	"github.com/dgraph-io/badger/v2/fb"
 	"github.com/dgraph-io/badger/v2/options"
 	"github.com/dgraph-io/badger/v2/pb"
 	"github.com/dgraph-io/badger/v2/y"
+	"github.com/dgraph-io/ristretto/z"
 	"github.com/spf13/cobra"
 )
 
@@ -504,13 +506,21 @@ func runTest(cmd *cobra.Command, args []string) error {
 				batch := tmpDb.NewWriteBatch()
 
 				stream := db.NewStream()
-				stream.Send = func(list *pb.KVList) error {
-					for _, kv := range list.Kv {
-						if err := batch.Set(kv.Key, kv.Value); err != nil {
-							return err
+				stream.Send = func(buf *z.Buffer) error {
+					return buf.SliceIterate(func(slice []byte) error {
+						kvs := fb.GetRootAsKVList(slice, 0)
+						var kv fb.KV
+						for i := 0; i < kvs.KvsLength(); i++ {
+							if !kvs.Kvs(&kv, i) {
+								return fmt.Errorf("while parsing kv at offset: %d", i)
+							}
+							if err := batch.Set(
+								y.Copy(kv.KeyBytes()), y.Copy(kv.ValueBytes())); err != nil {
+								return err
+							}
 						}
-					}
-					return nil
+						return nil
+					})
 				}
 				y.Check(stream.Orchestrate(context.Background()))
 				y.Check(batch.Flush())

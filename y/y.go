@@ -29,6 +29,8 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/dgraph-io/badger/v2/fb"
+	fbs "github.com/google/flatbuffers/go"
 	"github.com/pkg/errors"
 )
 
@@ -464,4 +466,17 @@ func (r *PageBufferReader) Read(p []byte) (int, error) {
 	}
 
 	return read, nil
+}
+
+func AddListAndFinish(builder *fbs.Builder, kvs []fbs.UOffsetT) {
+	fb.KVListStartKvsVector(builder, len(kvs))
+	for i := len(kvs) - 1; i >= 0; i-- {
+		builder.PrependUOffsetT(kvs[i])
+	}
+	end := builder.EndVector(len(kvs))
+
+	fb.KVListStart(builder)
+	fb.KVListAddKvs(builder, end)
+	uo := fb.KVListEnd(builder)
+	builder.Finish(uo)
 }
