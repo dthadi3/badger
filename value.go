@@ -558,8 +558,8 @@ func (vlog *valueLog) open(db *DB) error {
 	if err := vlog.populateFilesMap(); err != nil {
 		return err
 	}
-	// If no files are found, then create a new file.
-	if len(vlog.filesMap) == 0 {
+	// If no files are found and db is not opened in read only mode, then create a new file.
+	if len(vlog.filesMap) == 0 && !db.opt.ReadOnly {
 		_, err := vlog.createVlogFile()
 		return y.Wrapf(err, "Error while creating log file in valueLog.open")
 	}
@@ -580,6 +580,11 @@ func (vlog *valueLog) open(db *DB) error {
 			}
 			delete(vlog.filesMap, fid)
 		}
+	}
+
+	// In read-only mode, we should not truncate/create a vlog file.
+	if db.opt.ReadOnly {
+		return nil
 	}
 
 	// Now we can read the latest value log file, and see if it needs truncation. We could

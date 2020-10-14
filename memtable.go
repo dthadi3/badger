@@ -105,8 +105,8 @@ func (db *DB) openMemTable(fid int) (*memTable, error) {
 		opt: db.opt,
 		buf: &bytes.Buffer{},
 	}
-	// We don't need to create the wal for the skiplist in in-memory mode so return the mt.
-	if db.opt.InMemory {
+	// We don't need to create wal for the skiplist in in-memory or read-only mode so return the mt.
+	if db.opt.InMemory || db.opt.ReadOnly {
 		return mt, z.NewFile
 	}
 
