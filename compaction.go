@@ -34,6 +34,7 @@ type keyRange struct {
 	left  []byte
 	right []byte
 	inf   bool
+	count int
 }
 
 var infRange = keyRange{inf: true}
@@ -46,6 +47,20 @@ func (r keyRange) equals(dst keyRange) bool {
 	return bytes.Equal(r.left, dst.left) &&
 		bytes.Equal(r.right, dst.right) &&
 		r.inf == dst.inf
+}
+
+func (r keyRange) contains(key []byte) int {
+	left := y.CompareKeys(key, r.left)
+	if left < 0 {
+		// key is left of the r.left
+		return -1
+	}
+	right := y.CompareKeys(key, r.right)
+	if right >= 0 {
+		// key is right of the right. Can't equal r.right
+		return 1
+	}
+	return 0
 }
 
 func (r keyRange) overlapsWith(dst keyRange) bool {
@@ -241,10 +256,10 @@ func (s *levelsController) runCompactDef(l int, cd compactDef) (err error) {
 	// Note: For level 0, while doCompact is running, it is possible that new tables are added.
 	// However, the tables are added only to the end, so it is ok to just delete the first table.
 
-	if dur := time.Since(timeStart); dur > 3*time.Second {
+	if dur := time.Since(timeStart); dur > time.Millisecond {
 		s.kv.opt.Infof("LOG Compact %d->%d, del %d tables, add %d tables, took %v\n",
 			thisLevel.level, nextLevel.level, len(cd.top)+len(cd.bot),
-			len(newTables), dur)
+			len(newTables), dur.Truncate(time.Second))
 	}
 
 	if cd.thisLevel.level != 0 && len(newTables) > 2*s.kv.opt.LevelSizeMultiplier {
@@ -294,6 +309,69 @@ func (s *levelsController) compactBuildTables(
 		y.AssertTrue(len(topTables) == 1)
 		iters = []y.Iterator{topTables[0].NewIterator(table.NOCACHE)}
 	}
+
+	analyze := func() {
+		if len(iters) == 0 {
+			return
+		}
+		it := table.NewMergeIterator(iters, false)
+		it.Rewind()
+
+		var ranges []*keyRange
+		for _, table := range botTables {
+			left := y.Copy(table.Smallest())
+			for _, ks := range table.KeySplits(10000, nil) {
+				kr := &keyRange{
+					left:  left,
+					right: []byte(ks),
+				}
+				left = y.Copy(kr.right)
+				ranges = append(ranges, kr)
+			}
+			// kr := &keyRange{
+			// 	left:  table.Smallest(),
+			// 	right: table.Biggest(),
+			// }
+		}
+		var rangeIdx int
+
+		var numKeys int
+		for it.Valid() {
+			numKeys++
+			if rangeIdx >= len(ranges) {
+				it.Next()
+				continue
+			}
+			kr := ranges[rangeIdx]
+			c := kr.contains(it.Key())
+			if c > 0 {
+				numKeys--
+				rangeIdx++
+				continue
+			}
+			if c == 0 {
+				kr.count++
+			} else {
+				// ignore the key to the left of the range.
+			}
+			it.Next()
+		}
+
+		var noop, changed int
+		for _, kr := range ranges {
+			if kr.count == 0 {
+				noop++
+			} else {
+				changed++
+				// fmt.Printf("left: %x right: %x count: %d\n",
+				// 	kr.left[:8], kr.right[:8], kr.count)
+			}
+		}
+		fmt.Printf("numKeys: %d. Num bot tables: %d [%d -> %d] num blocks NOOP: %d (%.2f %%) changed: %d\n\n",
+			numKeys, len(cd.bot), cd.thisLevel.level, cd.nextLevel.level,
+			noop, float64(noop*100)/float64(noop+changed), changed)
+	}
+	analyze()
 
 	// Next level has level>=1 and we can use ConcatIterator as key ranges do not overlap.
 	var valid []*table.Table
