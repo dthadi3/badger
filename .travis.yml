@@ -31,6 +31,10 @@ jobs:
       arch: arm64
       go: "1.14"
       env: go_32=yes
+    - os: linux
+      arch: ppc64le
+      go: "1.14"
+      env: go_32=yes
 
 notifications:
   email: false
